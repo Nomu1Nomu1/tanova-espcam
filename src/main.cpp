@@ -1,13 +1,24 @@
 #include "Arduino.h"
 #include "esp_camera.h"
 #include "WiFi.h"
+#include "HTTPClient.h"
+#include "base64.h"
+#include "ArduinoJson.h"
 #include "esp_https_server.h"
 
 #include "cstdlib"
 
-const char *WIFI_SSID = std::getenv("WIFI_SSID");
-const char *WIFI_PASSWORD = std::getenv("WIFI_PASSWORD");
+const char *WIFI_SSID = std::getenv("WIFI_SSID_ENV");
+const char *WIFI_PASSWORD = std::getenv("WIFI_PASSWORD_ENV");
 
+const char *ROBOFLOW_API_KEY = std::getenv("ROBOFLOW_API_KEY_ENV");
+const char *ROBOFLOW_MODEL = std::getenv("ROBOFLOW_MODEL_ENV");
+const int ROBOFLOW_VERSION = 1;
+const float CONFIDENCE_THRESHOLD = 0.5;
+
+const unsigned long DETECT_INTERVAL_MS = 5UL * 60UL * 1000UL;
+
+#define BUZZER_PIN 2
 
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
@@ -131,6 +142,96 @@ void startWebServer()
     }
 }
 
+void soundAlert()
+{
+    for (int i = 0; i < 3; i++)
+    {
+        digitalWrite(BUZZER_PIN, HIGH);
+        delay(200);
+        digitalWrite(BUZZER_PIN, LOW);
+        delay(200);
+    }
+}
+
+void runDiseaseCheck()
+{
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb)
+    {
+        Serial.println("[Detect] Camera capture failed, skipping this check.");
+        return;
+    }
+
+    String encoded = base64::encode(fb->buf, fb->len);
+    esp_camera_fb_return(fb);
+
+    String url = String("https://detect.roboflow.com/") + ROBOFLOW_MODEL + "/" + ROBOFLOW_VERSION + "?api_key=" + ROBOFLOW_API_KEY;
+
+    HTTPClient http;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+    http.setTimeout(15000);
+
+    Serial.println("[Detect] Sending frame to Roboflow.");
+    int httpCode = http.POST(encoded);
+
+    if (httpCode != 200)
+    {
+        Serial.printf("[Detect] HTTP error: %d\n", httpCode);
+        Serial.println(http.getString());
+        http.end();
+        return;
+    }
+
+    String response = http.getString();
+    http.end();
+
+    JsonDocument doc;
+    DeserializationError error = deserializeJson(doc, response);
+    if (error)
+    {
+        Serial.print("[Detect] JSON parse failed: ");
+        Serial.println(error.c_str());
+        return;
+    }
+
+    JsonArray predictions = doc["predictions"].as<JsonArray>();
+    if (predictions.isNull() || predictions.size() == 0)
+    {
+        Serial.println("[Detect] No predictions returned (likely healthy / nothing detected)");
+        return;
+    }
+
+    // Find the highest-confidence prediction
+    const char *bestClass = nullptr;
+    float bestConfidence = 0.0;
+    for (JsonObject p : predictions)
+    {
+        float conf = p["confidence"] | 0.0;
+        if (conf > bestConfidence)
+        {
+            bestConfidence = conf;
+            bestClass = p["class"] | "unknown";
+        }
+    }
+
+    if (bestClass == nullptr)
+    {
+        Serial.println("[Detect] Could not determine top prediction");
+        return;
+    }
+
+    Serial.printf("[Detect] Top result: %s (%.1f%% confidence)\n", bestClass, bestConfidence * 100);
+
+    bool looksHealthy = (strcasestr(bestClass, "healthy") != nullptr);
+
+    if (!looksHealthy && bestConfidence >= CONFIDENCE_THRESHOLD)
+    {
+        Serial.printf("[ALERT] Possible disease detected: %s\n", bestClass);
+        soundAlert();
+    }
+}
+
 void setup()
 {
     Serial.begin(115200);
@@ -163,14 +264,14 @@ void setup()
 
     if (psramFound())
     {
-        config.frame_size = FRAMESIZE_UXGA;
+        config.frame_size = FRAMESIZE_SVGA;
         config.jpeg_quality = 10;
         config.fb_count = 2;
         config.grab_mode = CAMERA_GRAB_LATEST;
     }
     else
     {
-        config.frame_size = FRAMESIZE_SVGA;
+        config.frame_size = FRAMESIZE_VGA;
         config.jpeg_quality = 12;
         config.fb_count = 1;
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
@@ -206,9 +307,25 @@ void setup()
     Serial.print("Raw MJPEG stream:   http://");
     Serial.print(WiFi.localIP());
     Serial.println(":81/stream");
+
+    Serial.printf("Disease check will run every %lu seconds\n", DETECT_INTERVAL_MS / 1000);
 }
+
+unsigned long lastDetectTime = 0;
 
 void loop()
 {
+    if (millis() - lastDetectTime >= DETECT_INTERVAL_MS)
+    {
+        lastDetectTime = millis();
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            runDiseaseCheck();
+        }
+        else
+        {
+            Serial.println("[Detect] WiFi not connected, skipping check");
+        }
+    }
     delay(10000);
 }
