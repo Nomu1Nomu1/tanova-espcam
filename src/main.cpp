@@ -5,10 +5,9 @@
 
 #include "cstdlib"
 
-// const char *WIFI_SSID = std::getenv("WIFI_SSID");
-const char *WIFI_SSID = "Maximizer_2.4G";
-// const char *WIFI_PASSWORD = std::getenv("WIFI_PASSWORD");
-const char *WIFI_PASSWORD = "WhyYouAskForIt";
+const char *WIFI_SSID = std::getenv("WIFI_SSID");
+const char *WIFI_PASSWORD = std::getenv("WIFI_PASSWORD");
+
 
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
