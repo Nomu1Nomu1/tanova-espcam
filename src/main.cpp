@@ -1,6 +1,7 @@
 #include "Arduino.h"
 #include "esp_camera.h"
 #include "WiFi.h"
+#include "WiFiClientSecure.h"
 #include "HTTPClient.h"
 #include "base64.h"
 #include "ArduinoJson.h"
@@ -164,18 +165,49 @@ void runDiseaseCheck()
         return;
     }
 
+    Serial.printf("[Detect] Free heap before encode: %u bytes\n", ESP.getFreeHeap());
+    Serial.printf("[Detect] Frame size: %u bytes\n", fb->len);
+
     String encoded = base64::encode(fb->buf, fb->len);
     esp_camera_fb_return(fb);
+
+    Serial.printf("[Detect] Encoded size: %u bytes, free heap after encode: %u bytes\n",
+                  encoded.length(), ESP.getFreeHeap());
+
+    WiFiClientSecure client;
+    client.setInsecure();
+
+    Serial.println("[Detect] Connecting to detect.roboflow.com:443 ...");
+    unsigned long connectStart = millis();
+    bool connected = client.connect("detect.roboflow.com", 443, 10000); // timeout 10 detik manual
+    Serial.printf("[Detect] Connect result: %s, took %lu ms\n",
+                  connected ? "OK" : "FAILED", millis() - connectStart);
+
+    if (!connected)
+    {
+        Serial.println("[Detect] TLS connect failed/timeout, aborting this cycle.");
+        client.stop();
+        return;
+    }
 
     String url = String("https://detect.roboflow.com/") + ROBOFLOW_MODEL + "/" + ROBOFLOW_VERSION + "?api_key=" + ROBOFLOW_API_KEY;
 
     HTTPClient http;
-    http.begin(url);
+    http.begin(client, url);
     http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.setTimeout(15000);
+    http.setTimeout(20000);
 
     Serial.println("[Detect] Sending frame to Roboflow.");
+    unsigned long postStart = millis();
     int httpCode = http.POST(encoded);
+    Serial.printf("[Detect] POST returned %d, took %lu ms\n", httpCode, millis() - postStart);
+
+    if (httpCode <= 0)
+    {
+        Serial.printf("[Detect] HTTP request failed: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
+        http.end();
+        return;
+    }
 
     if (httpCode != 200)
     {
@@ -204,7 +236,6 @@ void runDiseaseCheck()
         return;
     }
 
-    // Find the highest-confidence prediction
     const char *bestClass = nullptr;
     float bestConfidence = 0.0;
     for (JsonObject p : predictions)
