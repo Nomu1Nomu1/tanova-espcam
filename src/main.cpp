@@ -6,17 +6,19 @@
 #include "ArduinoJson.h"
 #include "esp_https_server.h"
 
-#include "cstdlib"
+#include "secrets.h"
 
-const char *WIFI_SSID = std::getenv("WIFI_SSID_ENV");
-const char *WIFI_PASSWORD = std::getenv("WIFI_PASSWORD_ENV");
+// // WiFi Credentials
+// const char *WIFI_SSID = "Maximizer_2.4G";
+// const char *WIFI_PASSWORD = "WhyYouAskForIt";
 
-const char *ROBOFLOW_API_KEY = std::getenv("ROBOFLOW_API_KEY_ENV");
-const char *ROBOFLOW_MODEL = std::getenv("ROBOFLOW_MODEL_ENV");
+// // Roboflow Settings
+// const char *ROBOFLOW_API_KEY = "2MhnDp32Hp98OchCY5d4";
+// const char *ROBOFLOW_MODEL = "plant-disease-detection-k6wnw";
 const int ROBOFLOW_VERSION = 1;
 const float CONFIDENCE_THRESHOLD = 0.5;
 
-const unsigned long DETECT_INTERVAL_MS = 5UL * 60UL * 1000UL;
+const unsigned long DETECT_INTERVAL_MS = 300;
 
 #define BUZZER_PIN 2
 
