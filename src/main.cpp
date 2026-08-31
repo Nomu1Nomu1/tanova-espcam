@@ -9,17 +9,10 @@
 
 #include "secrets.h"
 
-// // WiFi Credentials
-// const char *WIFI_SSID = "Maximizer_2.4G";
-// const char *WIFI_PASSWORD = "WhyYouAskForIt";
-
-// // Roboflow Settings
-// const char *ROBOFLOW_API_KEY = "2MhnDp32Hp98OchCY5d4";
-// const char *ROBOFLOW_MODEL = "plant-disease-detection-k6wnw";
 const int ROBOFLOW_VERSION = 1;
 const float CONFIDENCE_THRESHOLD = 0.5;
 
-const unsigned long DETECT_INTERVAL_MS = 300;
+const unsigned long DETECT_INTERVAL_MS = 3UL * 1000UL; // 3 seconds
 
 #define BUZZER_PIN 2
 
@@ -190,35 +183,77 @@ void runDiseaseCheck()
         return;
     }
 
-    String url = String("https://detect.roboflow.com/") + ROBOFLOW_MODEL + "/" + ROBOFLOW_VERSION + "?api_key=" + ROBOFLOW_API_KEY;
+    String path = String("/") + ROBOFLOW_MODEL + "/" + ROBOFLOW_VERSION + "?api_key=" + ROBOFLOW_API_KEY;
 
-    HTTPClient http;
-    http.begin(client, url);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-    http.setTimeout(20000);
+    // Write HTTP request manually to avoid HTTPClient's single-write buffer overflow
+    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
+    client.println("Host: detect.roboflow.com");
+    client.println("Content-Type: application/x-www-form-urlencoded");
+    client.printf("Content-Length: %u\r\n", encoded.length());
+    client.println("Connection: close");
+    client.println(); // end of headers
 
-    Serial.println("[Detect] Sending frame to Roboflow.");
+    // Send body in small chunks (4KB) to avoid TLS buffer overflow
+    Serial.println("[Detect] Sending frame to Roboflow...");
     unsigned long postStart = millis();
-    int httpCode = http.POST(encoded);
-    Serial.printf("[Detect] POST returned %d, took %lu ms\n", httpCode, millis() - postStart);
-
-    if (httpCode <= 0)
+    const size_t CHUNK_SIZE = 4096;
+    size_t offset = 0;
+    bool sendOk = true;
+    while (offset < encoded.length())
     {
-        Serial.printf("[Detect] HTTP request failed: %d (%s)\n", httpCode, http.errorToString(httpCode).c_str());
-        http.end();
+        size_t toSend = min(CHUNK_SIZE, encoded.length() - offset);
+        size_t written = client.write((const uint8_t *)(encoded.c_str() + offset), toSend);
+        if (written == 0)
+        {
+            Serial.println("[Detect] Write failed during chunked send");
+            sendOk = false;
+            break;
+        }
+        offset += written;
+    }
+
+    if (!sendOk)
+    {
+        client.stop();
         return;
     }
 
-    if (httpCode != 200)
+    Serial.printf("[Detect] Payload sent (%u bytes), took %lu ms. Waiting for response...\n",
+                  offset, millis() - postStart);
+
+    // Wait for response with timeout
+    unsigned long responseStart = millis();
+    while (client.connected() && !client.available())
     {
-        Serial.printf("[Detect] HTTP error: %d\n", httpCode);
-        Serial.println(http.getString());
-        http.end();
-        return;
+        if (millis() - responseStart > 20000)
+        {
+            Serial.println("[Detect] Response timeout");
+            client.stop();
+            return;
+        }
+        delay(10);
     }
 
-    String response = http.getString();
-    http.end();
+    // Read HTTP status line
+    String statusLine = client.readStringUntil('\n');
+    int httpCode = 0;
+    if (statusLine.startsWith("HTTP/"))
+    {
+        httpCode = statusLine.substring(9, 12).toInt();
+    }
+    Serial.printf("[Detect] HTTP %d, response took %lu ms\n", httpCode, millis() - responseStart);
+
+    // Skip remaining headers
+    while (client.connected())
+    {
+        String line = client.readStringUntil('\n');
+        if (line == "\r" || line.length() == 0)
+            break;
+    }
+
+    // Read body
+    String response = client.readString();
+    client.stop();
 
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, response);
@@ -331,6 +366,13 @@ void setup()
     }
     Serial.println();
     Serial.println("Wifi connected");
+
+    // Use Google DNS to avoid router DNS issues
+    IPAddress dns1(8, 8, 8, 8);
+    IPAddress dns2(8, 8, 4, 4);
+    WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
+    Serial.printf("DNS configured: %s / %s\n", dns1.toString().c_str(), dns2.toString().c_str());
+    Serial.printf("IP: %s  Gateway: %s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
 
     startWebServer();
 
