@@ -5,6 +5,6 @@
 #define WIFI_PASSWORD "1234567890"
 
 // Roboflow Configuration
-#define ROBOFLOW_API_KEY "2MhnDp32Hp98OchCY5d4"
-#define ROBOFLOW_MODEL "plant-disease-detection-k6wnw"
+#define ROBOFLOW_API_KEY ""
+#define ROBOFLOW_MODEL ""
 
