@@ -8,11 +8,12 @@
 #include "esp_https_server.h"
 
 #include "secrets.h"
+#include "lidar.h"
 
 const int ROBOFLOW_VERSION = 1;
 const float CONFIDENCE_THRESHOLD = 0.5;
 
-const unsigned long DETECT_INTERVAL_MS = 3UL * 1000UL; // 3 seconds
+const unsigned long DETECT_INTERVAL_MS = 3UL * 1000UL; // Cooldown between detections (3s)
 
 #define BUZZER_PIN 2
 
@@ -383,24 +384,53 @@ void setup()
     Serial.print(WiFi.localIP());
     Serial.println(":81/stream");
 
-    Serial.printf("Disease check will run every %lu seconds\n", DETECT_INTERVAL_MS / 1000);
+    // Initialize TF-Luna LiDAR
+    initLidar();
 }
 
 unsigned long lastDetectTime = 0;
+unsigned long lastLidarLog = 0;
+TFLunaData currentLidar;
 
 void loop()
 {
-    if (millis() - lastDetectTime >= DETECT_INTERVAL_MS)
+    // Continuously read LiDAR data stream
+    if (readTFLuna(currentLidar))
     {
-        lastDetectTime = millis();
-        if (WiFi.status() == WL_CONNECTED)
+        // Periodic debug log for LiDAR status (every 1 second)
+        if (millis() - lastLidarLog >= 1000)
         {
-            runDiseaseCheck();
-        }
-        else
-        {
-            Serial.println("[Detect] WiFi not connected, skipping check");
+            lastLidarLog = millis();
+            Serial.printf("[LiDAR] Distance: %d cm | Strength: %d | Temp: %.1f C\n",
+                          currentLidar.distance, currentLidar.strength, currentLidar.temp_c);
         }
     }
-    delay(10000);
+
+    // Check if cooldown between detections has passed
+    if (millis() - lastDetectTime >= DETECT_INTERVAL_MS)
+    {
+        // Check if a plant stick is detected within the designated range
+        bool plantInPosition = currentLidar.valid &&
+                               (currentLidar.distance >= PLANT_MIN_DIST_CM &&
+                                currentLidar.distance <= PLANT_MAX_DIST_CM) &&
+                               (currentLidar.strength >= PLANT_MIN_STRENGTH);
+
+        if (plantInPosition)
+        {
+            Serial.printf("\n[Detect] >>> Plant stick detected at %d cm (Strength: %d)! <<<\n",
+                          currentLidar.distance, currentLidar.strength);
+            lastDetectTime = millis();
+
+            if (WiFi.status() == WL_CONNECTED)
+            {
+                runDiseaseCheck();
+            }
+            else
+            {
+                Serial.println("[Detect] WiFi not connected, skipping check");
+            }
+        }
+    }
+
+    delay(20); // Responsive non-blocking loop
 }
