@@ -9,11 +9,16 @@
 
 #include "secrets.h"
 #include "lidar.h"
+#include "display_oled.h"
 
 const int ROBOFLOW_VERSION = 1;
 const float CONFIDENCE_THRESHOLD = 0.5;
 
 const unsigned long DETECT_INTERVAL_MS = 3UL * 1000UL; // Cooldown between detections (3s)
+
+String latestDisease = "Standby";
+float latestConfidence = 0.0;
+unsigned long lastDisplayUpdate = 0;
 
 #define BUZZER_PIN 2
 
@@ -269,6 +274,8 @@ void runDiseaseCheck()
     if (predictions.isNull() || predictions.size() == 0)
     {
         Serial.println("[Detect] No predictions returned (likely healthy / nothing detected)");
+        latestDisease = "Healthy/Clear";
+        latestConfidence = 1.0;
         return;
     }
 
@@ -290,6 +297,9 @@ void runDiseaseCheck()
         return;
     }
 
+    latestDisease = String(bestClass);
+    latestConfidence = bestConfidence;
+
     Serial.printf("[Detect] Top result: %s (%.1f%% confidence)\n", bestClass, bestConfidence * 100);
 
     bool looksHealthy = (strcasestr(bestClass, "healthy") != nullptr);
@@ -297,6 +307,7 @@ void runDiseaseCheck()
     if (!looksHealthy && bestConfidence >= CONFIDENCE_THRESHOLD)
     {
         Serial.printf("[ALERT] Possible disease detected: %s\n", bestClass);
+        displayShowDiseaseAlert(bestClass, bestConfidence);
         soundAlert();
     }
 }
@@ -306,6 +317,9 @@ void setup()
     Serial.begin(115200);
     Serial.setDebugOutput(true);
     Serial.println();
+
+    // Initialize 1.3" OLED Display (SH1106)
+    initDisplay();
 
     // --- FIX: inisialisasi buzzer sebagai OUTPUT ---
     pinMode(BUZZER_PIN, OUTPUT);
@@ -362,6 +376,7 @@ void setup()
     // s->set_vflip(s, 1);
     // s->set_hmirror(s, 1);
 
+    displayShowWiFiConnecting(WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("Connecting to wifi...");
     while (WiFi.status() != WL_CONNECTED)
@@ -378,6 +393,8 @@ void setup()
     WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
     Serial.printf("DNS configured: %s / %s\n", dns1.toString().c_str(), dns2.toString().c_str());
     Serial.printf("IP: %s  Gateway: %s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
+
+    displayShowWiFiConnected(WiFi.localIP());
 
     startWebServer();
 
@@ -410,15 +427,23 @@ void loop()
         }
     }
 
+    // Check if a plant stick is detected within designated range
+    bool plantInPosition = currentLidar.valid &&
+                           (currentLidar.distance >= PLANT_MIN_DIST_CM &&
+                            currentLidar.distance <= PLANT_MAX_DIST_CM) &&
+                           (currentLidar.strength >= PLANT_MIN_STRENGTH);
+
+    // Update OLED monitor display periodically (every 500ms)
+    if (millis() - lastDisplayUpdate >= 500)
+    {
+        lastDisplayUpdate = millis();
+        displayUpdate(currentLidar.distance, currentLidar.strength, plantInPosition,
+                      latestDisease.c_str(), latestConfidence);
+    }
+
     // Check if cooldown between detections has passed
     if (millis() - lastDetectTime >= DETECT_INTERVAL_MS)
     {
-        // Check if a plant stick is detected within the designated range
-        bool plantInPosition = currentLidar.valid &&
-                               (currentLidar.distance >= PLANT_MIN_DIST_CM &&
-                                currentLidar.distance <= PLANT_MAX_DIST_CM) &&
-                               (currentLidar.strength >= PLANT_MIN_STRENGTH);
-
         if (plantInPosition)
         {
             Serial.printf("\n[Detect] >>> Plant stick detected at %d cm (Strength: %d)! <<<\n",
