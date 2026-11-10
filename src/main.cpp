@@ -3,19 +3,49 @@
 #include "WiFi.h"
 #include "WiFiClientSecure.h"
 #include "HTTPClient.h"
-#include "base64.h"
 #include "ArduinoJson.h"
 #include "esp_https_server.h"
 
 #include "secrets.h"
-#include "lidar.h"
+#include "driver/rtc_io.h"
+#include "pins.h"
+#include "display_oled.h"
 
-const int ROBOFLOW_VERSION = 1;
+// --- Tanova AI API (isi di secrets.h: API_HOST wajib, sisanya opsional) ---
+//   #define API_HOST "tanova-ai.example.com"   // tanpa http(s)://
+//   #define API_PORT 443                       // 443 untuk HTTPS, 3000/80 untuk HTTP
+//   #define API_USE_TLS 1                      // 0 jika HTTP biasa
+//   #define API_KEY "..."                      // kosongkan jika auth dinonaktifkan
+#ifndef API_HOST
+#error "Define API_HOST in secrets.h"
+#endif
+#ifndef API_PORT
+#define API_PORT 443
+#endif
+#ifndef API_USE_TLS
+#define API_USE_TLS 1
+#endif
+#ifndef API_KEY
+#define API_KEY ""
+#endif
+#ifndef API_PATH
+#define API_PATH "/api/analyze"
+#endif
+#ifndef DEVICE_ID
+#define DEVICE_ID "esp32-cam-01"
+#endif
+
 const float CONFIDENCE_THRESHOLD = 0.5;
 
-const unsigned long DETECT_INTERVAL_MS = 3UL * 1000UL; // Cooldown between detections (3s)
+// Jeda deteksi otomatis, dihitung setelah request selesai.
+// Gemini free tier: 15 request/menit, 1500/hari -> 60 detik = ~1440/hari.
+const unsigned long DETECT_INTERVAL_MS = 5UL * 1000UL;
 
-#define BUZZER_PIN 2
+String latestDisease = "Standby";
+float latestConfidence = 0.0;
+unsigned long lastDisplayUpdate = 0;
+
+#define BUZZER_PIN PIN_BUZZER
 
 #define PWDN_GPIO_NUM -1
 #define RESET_GPIO_NUM -1
@@ -159,51 +189,54 @@ void runDiseaseCheck()
         return;
     }
 
-    Serial.printf("[Detect] Free heap before encode: %u bytes\n", ESP.getFreeHeap());
-    Serial.printf("[Detect] Frame size: %u bytes\n", fb->len);
+    size_t imgLen = fb->len;
+    Serial.printf("[Detect] Free heap: %u bytes, frame size: %u bytes\n", ESP.getFreeHeap(), imgLen);
+    displayShowAnalyzing();
 
-    String encoded = base64::encode(fb->buf, fb->len);
-    esp_camera_fb_return(fb);
+    // Kirim JPEG mentah (tanpa base64) ke API Tanova AI
+    WiFiClientSecure secureClient;
+    WiFiClient plainClient;
+    WiFiClient *client = &plainClient;
+#if API_USE_TLS
+    secureClient.setInsecure();
+    client = &secureClient;
+#endif
 
-    Serial.printf("[Detect] Encoded size: %u bytes, free heap after encode: %u bytes\n",
-                  encoded.length(), ESP.getFreeHeap());
-
-    WiFiClientSecure client;
-    client.setInsecure();
-
-    Serial.println("[Detect] Connecting to detect.roboflow.com:443 ...");
+    Serial.printf("[Detect] Connecting to %s:%d ...\n", API_HOST, API_PORT);
     unsigned long connectStart = millis();
-    bool connected = client.connect("detect.roboflow.com", 443, 10000); // timeout 10 detik manual
+    bool connected = client->connect(API_HOST, API_PORT, 10000);
     Serial.printf("[Detect] Connect result: %s, took %lu ms\n",
                   connected ? "OK" : "FAILED", millis() - connectStart);
 
     if (!connected)
     {
-        Serial.println("[Detect] TLS connect failed/timeout, aborting this cycle.");
-        client.stop();
+        Serial.println("[Detect] Connect failed/timeout, aborting this cycle.");
+        client->stop();
+        esp_camera_fb_return(fb);
         return;
     }
 
-    String path = String("/") + ROBOFLOW_MODEL + "/" + ROBOFLOW_VERSION + "?api_key=" + ROBOFLOW_API_KEY;
+    // Write HTTP request manually
+    client->printf("POST %s HTTP/1.1\r\n", API_PATH);
+    client->printf("Host: %s\r\n", API_HOST);
+    client->println("Content-Type: image/jpeg");
+    client->printf("Content-Length: %u\r\n", imgLen);
+    client->printf("x-device-id: %s\r\n", DEVICE_ID);
+    if (strlen(API_KEY) > 0)
+        client->printf("x-api-key: %s\r\n", API_KEY);
+    client->println("Connection: close");
+    client->println(); // end of headers
 
-    // Write HTTP request manually to avoid HTTPClient's single-write buffer overflow
-    client.printf("POST %s HTTP/1.1\r\n", path.c_str());
-    client.println("Host: detect.roboflow.com");
-    client.println("Content-Type: application/x-www-form-urlencoded");
-    client.printf("Content-Length: %u\r\n", encoded.length());
-    client.println("Connection: close");
-    client.println(); // end of headers
-
-    // Send body in small chunks (4KB) to avoid TLS buffer overflow
-    Serial.println("[Detect] Sending frame to Roboflow...");
+    // Send body in small chunks (4KB)
+    Serial.println("[Detect] Sending frame to API...");
     unsigned long postStart = millis();
     const size_t CHUNK_SIZE = 4096;
     size_t offset = 0;
     bool sendOk = true;
-    while (offset < encoded.length())
+    while (offset < imgLen)
     {
-        size_t toSend = min(CHUNK_SIZE, encoded.length() - offset);
-        size_t written = client.write((const uint8_t *)(encoded.c_str() + offset), toSend);
+        size_t toSend = min(CHUNK_SIZE, imgLen - offset);
+        size_t written = client->write(fb->buf + offset, toSend);
         if (written == 0)
         {
             Serial.println("[Detect] Write failed during chunked send");
@@ -212,31 +245,32 @@ void runDiseaseCheck()
         }
         offset += written;
     }
+    esp_camera_fb_return(fb); // frame buffer bisa dilepas setelah terkirim
 
     if (!sendOk)
     {
-        client.stop();
+        client->stop();
         return;
     }
 
     Serial.printf("[Detect] Payload sent (%u bytes), took %lu ms. Waiting for response...\n",
                   offset, millis() - postStart);
 
-    // Wait for response with timeout
+    // Gemini butuh beberapa detik, timeout 30 detik
     unsigned long responseStart = millis();
-    while (client.connected() && !client.available())
+    while (client->connected() && !client->available())
     {
-        if (millis() - responseStart > 20000)
+        if (millis() - responseStart > 30000)
         {
             Serial.println("[Detect] Response timeout");
-            client.stop();
+            client->stop();
             return;
         }
         delay(10);
     }
 
     // Read HTTP status line
-    String statusLine = client.readStringUntil('\n');
+    String statusLine = client->readStringUntil('\n');
     int httpCode = 0;
     if (statusLine.startsWith("HTTP/"))
     {
@@ -245,60 +279,175 @@ void runDiseaseCheck()
     Serial.printf("[Detect] HTTP %d, response took %lu ms\n", httpCode, millis() - responseStart);
 
     // Skip remaining headers
-    while (client.connected())
+    while (client->connected())
     {
-        String line = client.readStringUntil('\n');
+        String line = client->readStringUntil('\n');
         if (line == "\r" || line.length() == 0)
             break;
     }
 
     // Read body
-    String response = client.readString();
-    client.stop();
+    String response = client->readString();
+    client->stop();
+
+    // Buang chunk-size marker jika server/proxy memakai chunked encoding
+    int jsonStart = response.indexOf('{');
+    int jsonEnd = response.lastIndexOf('}');
+    if (jsonStart >= 0 && jsonEnd > jsonStart)
+        response = response.substring(jsonStart, jsonEnd + 1);
+
+    // Hanya ambil field yang dibutuhkan (field "text" panjang, tidak dipakai)
+    JsonDocument filter;
+    filter["status"] = true;
+    filter["plant"] = true;
+    filter["problem"] = true;
+    filter["confidence"] = true;
+    filter["error"] = true;
 
     JsonDocument doc;
-    DeserializationError error = deserializeJson(doc, response);
+    DeserializationError error = deserializeJson(doc, response, DeserializationOption::Filter(filter));
     if (error)
     {
         Serial.print("[Detect] JSON parse failed: ");
         Serial.println(error.c_str());
+        latestDisease = "API Error";
+        latestConfidence = 0.0;
         return;
     }
 
-    JsonArray predictions = doc["predictions"].as<JsonArray>();
-    if (predictions.isNull() || predictions.size() == 0)
+    // 422 = gambar bukan tanaman
+    if (httpCode == 422)
     {
-        Serial.println("[Detect] No predictions returned (likely healthy / nothing detected)");
+        Serial.println("[Detect] Not a plant, ignoring.");
+        latestDisease = "Bukan Tanaman";
+        latestConfidence = 0.0;
         return;
     }
 
-    const char *bestClass = nullptr;
-    float bestConfidence = 0.0;
-    for (JsonObject p : predictions)
+    if (httpCode != 200)
     {
-        float conf = p["confidence"] | 0.0;
-        if (conf > bestConfidence)
-        {
-            bestConfidence = conf;
-            bestClass = p["class"] | "unknown";
-        }
-    }
-
-    if (bestClass == nullptr)
-    {
-        Serial.println("[Detect] Could not determine top prediction");
+        const char *errMsg = doc["error"] | "unknown";
+        Serial.printf("[Detect] API error %d: %s\n", httpCode, errMsg);
+        latestDisease = "API Error";
+        latestConfidence = 0.0;
         return;
     }
 
-    Serial.printf("[Detect] Top result: %s (%.1f%% confidence)\n", bestClass, bestConfidence * 100);
+    const char *status = doc["status"] | "";
+    const char *plant = doc["plant"] | "unknown";
+    float confidence = (doc["confidence"] | 0.0f) / 100.0f; // API: 0-100, internal: 0-1
 
-    bool looksHealthy = (strcasestr(bestClass, "healthy") != nullptr);
-
-    if (!looksHealthy && bestConfidence >= CONFIDENCE_THRESHOLD)
+    if (strcmp(status, "healthy") == 0)
     {
-        Serial.printf("[ALERT] Possible disease detected: %s\n", bestClass);
+        Serial.printf("[Detect] Healthy: %s (%.1f%% confidence)\n", plant, confidence * 100);
+        latestDisease = "Healthy/Clear";
+        latestConfidence = confidence;
+        return;
+    }
+
+    if (strcmp(status, "disease") != 0)
+    {
+        Serial.printf("[Detect] Unexpected status: '%s'\n", status);
+        return;
+    }
+
+    const char *problem = doc["problem"] | "unknown";
+    latestDisease = String(problem);
+    latestConfidence = confidence;
+
+    Serial.printf("[Detect] Top result: %s on %s (%.1f%% confidence)\n", problem, plant, confidence * 100);
+
+    if (confidence >= CONFIDENCE_THRESHOLD)
+    {
+        Serial.printf("[ALERT] Possible disease detected: %s\n", problem);
+        displayShowDiseaseAlert(problem, confidence);
         soundAlert();
     }
+}
+
+// Masuk Deep Sleep (matikan kipas, layar, lalu tunggu tombol ditekan)
+void masukDeepSleep()
+{
+    digitalWrite(PIN_KIPAS, LOW);
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    display.setCursor(10, 25);
+    display.println(F("Sistem Dimatikan..."));
+    display.display();
+
+    digitalWrite(PIN_BUZZER, HIGH);
+    delay(300);
+    digitalWrite(PIN_BUZZER, LOW);
+    delay(700);
+
+    display.clearDisplay();
+    display.display();
+
+    // Tunggu tombol dilepas
+    while (digitalRead(PIN_TOMBOL) == LOW)
+    {
+        delay(50);
+    }
+    delay(200);
+
+    // Wake-up saat tombol ditekan (LOW)
+    rtc_gpio_pullup_en((gpio_num_t)PIN_TOMBOL);
+    rtc_gpio_pulldown_dis((gpio_num_t)PIN_TOMBOL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOMBOL, 0);
+    esp_deep_sleep_start();
+}
+
+// Tampilkan progress bar tahan tombol; return true jika ditahan 5 detik
+bool tahanTombol5Detik(const __FlashStringHelper *label)
+{
+    unsigned long mulaiTekan = millis();
+    while (digitalRead(PIN_TOMBOL) == LOW)
+    {
+        unsigned long durasi = millis() - mulaiTekan;
+        if (durasi >= 5000)
+            return true;
+        display.clearDisplay();
+        display.setTextSize(1);
+        display.setTextColor(SH110X_WHITE);
+        display.setCursor(0, 15);
+        display.println(label);
+        int bar = map(durasi, 0, 5000, 0, 128);
+        display.fillRect(0, 35, bar, 10, SH110X_WHITE);
+        display.display();
+        delay(50);
+    }
+    return false;
+}
+
+// Bangun dari Deep Sleep: wajib tahan tombol 5 detik, jika tidak tidur lagi
+void bootPowerGate()
+{
+    if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
+    {
+        if (!tahanTombol5Detik(F("Tahan untuk ON...")))
+        {
+            masukDeepSleep();
+        }
+    }
+}
+
+// Tombol ditahan 5 detik -> matikan. Return true jika hanya di-tap (dilepas < 5 detik)
+bool checkPowerButton()
+{
+    if (digitalRead(PIN_TOMBOL) == LOW)
+    {
+        delay(30); // debounce
+        if (digitalRead(PIN_TOMBOL) != LOW)
+            return false;
+        if (tahanTombol5Detik(F("Tahan untuk OFF...")))
+        {
+            masukDeepSleep();
+        }
+        return true;
+    }
+    return false;
 }
 
 void setup()
@@ -307,9 +456,28 @@ void setup()
     Serial.setDebugOutput(true);
     Serial.println();
 
-    // --- FIX: inisialisasi buzzer sebagai OUTPUT ---
+    // Initialize 1.3" OLED Display (SH1106)
+    initDisplay();
+
+    // Inisialisasi pin I/O (tombol, kipas, buzzer)
+    pinMode(PIN_TOMBOL, INPUT_PULLUP);
+    pinMode(PIN_KIPAS, OUTPUT);
+    digitalWrite(PIN_KIPAS, LOW);
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
+
+    // Validasi tombol saat bangun dari Deep Sleep
+    bootPowerGate();
+
+    // Sistem resmi nyala: kipas ON + beep
+    digitalWrite(PIN_KIPAS, HIGH);
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(150);
+    digitalWrite(BUZZER_PIN, LOW);
+    while (digitalRead(PIN_TOMBOL) == LOW)
+    {
+        delay(50);
+    }
 
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
@@ -337,15 +505,15 @@ void setup()
 
     if (psramFound())
     {
-        config.frame_size = FRAMESIZE_SVGA;
-        config.jpeg_quality = 10;
+        config.frame_size = FRAMESIZE_VGA; // VGA agar stream lebih lancar
+        config.jpeg_quality = 15;
         config.fb_count = 2;
         config.grab_mode = CAMERA_GRAB_LATEST;
     }
     else
     {
         config.frame_size = FRAMESIZE_VGA;
-        config.jpeg_quality = 12;
+        config.jpeg_quality = 15;
         config.fb_count = 1;
         config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
     }
@@ -362,6 +530,7 @@ void setup()
     // s->set_vflip(s, 1);
     // s->set_hmirror(s, 1);
 
+    displayShowWiFiConnecting(WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     Serial.print("Connecting to wifi...");
     while (WiFi.status() != WL_CONNECTED)
@@ -371,6 +540,7 @@ void setup()
     }
     Serial.println();
     Serial.println("Wifi connected");
+    WiFi.setSleep(false); // matikan WiFi power saving agar stream tidak lag
 
     // Use Google DNS to avoid router DNS issues
     IPAddress dns1(8, 8, 8, 8);
@@ -378,6 +548,8 @@ void setup()
     WiFi.config(WiFi.localIP(), WiFi.gatewayIP(), WiFi.subnetMask(), dns1, dns2);
     Serial.printf("DNS configured: %s / %s\n", dns1.toString().c_str(), dns2.toString().c_str());
     Serial.printf("IP: %s  Gateway: %s\n", WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str());
+
+    displayShowWiFiConnected(WiFi.localIP());
 
     startWebServer();
 
@@ -387,53 +559,39 @@ void setup()
     Serial.print("Raw MJPEG stream:   http://");
     Serial.print(WiFi.localIP());
     Serial.println(":81/stream");
-
-    // Initialize TF-Luna LiDAR
-    initLidar();
 }
 
 unsigned long lastDetectTime = 0;
-unsigned long lastLidarLog = 0;
-TFLunaData currentLidar;
 
 void loop()
 {
-    // Continuously read LiDAR data stream
-    if (readTFLuna(currentLidar))
+    // Tahan tombol 5 detik = matikan
+    checkPowerButton();
+
+    unsigned long sinceLast = millis() - lastDetectTime;
+    int secondsLeft = (sinceLast >= DETECT_INTERVAL_MS) ? 0 : (int)((DETECT_INTERVAL_MS - sinceLast) / 1000UL) + 1;
+
+    // Update OLED monitor display periodically (every 250ms, agar animasi charging mulus)
+    if (millis() - lastDisplayUpdate >= 250)
     {
-        // Periodic debug log for LiDAR status (every 1 second)
-        if (millis() - lastLidarLog >= 1000)
-        {
-            lastLidarLog = millis();
-            Serial.printf("[LiDAR] Distance: %d cm | Strength: %d | Temp: %.1f C\n",
-                          currentLidar.distance, currentLidar.strength, currentLidar.temp_c);
-        }
+        lastDisplayUpdate = millis();
+        displayUpdate(secondsLeft, latestDisease.c_str(), latestConfidence);
     }
 
-    // Check if cooldown between detections has passed
-    if (millis() - lastDetectTime >= DETECT_INTERVAL_MS)
+    // Deteksi otomatis tiap DETECT_INTERVAL_MS
+    if (sinceLast >= DETECT_INTERVAL_MS)
     {
-        // Check if a plant stick is detected within the designated range
-        bool plantInPosition = currentLidar.valid &&
-                               (currentLidar.distance >= PLANT_MIN_DIST_CM &&
-                                currentLidar.distance <= PLANT_MAX_DIST_CM) &&
-                               (currentLidar.strength >= PLANT_MIN_STRENGTH);
+        Serial.println("\n[Detect] >>> Scheduled scan <<<");
 
-        if (plantInPosition)
+        if (WiFi.status() == WL_CONNECTED)
         {
-            Serial.printf("\n[Detect] >>> Plant stick detected at %d cm (Strength: %d)! <<<\n",
-                          currentLidar.distance, currentLidar.strength);
-            lastDetectTime = millis();
-
-            if (WiFi.status() == WL_CONNECTED)
-            {
-                runDiseaseCheck();
-            }
-            else
-            {
-                Serial.println("[Detect] WiFi not connected, skipping check");
-            }
+            runDiseaseCheck();
         }
+        else
+        {
+            Serial.println("[Detect] WiFi not connected, skipping check");
+        }
+        lastDetectTime = millis(); // mulai cooldown setelah request selesai
     }
 
     delay(20); // Responsive non-blocking loop
