@@ -365,7 +365,58 @@ void runDiseaseCheck()
     }
 }
 
-// Masuk Deep Sleep (matikan kipas, layar, lalu tunggu tombol ditekan)
+bool tahanTombol5Detik(const __FlashStringHelper *label); // forward declaration
+
+// Deep Sleep sungguhan: layar mati, bangun lagi saat tombol ditekan
+static void mulaiDeepSleep()
+{
+    display.clearDisplay();
+    display.display();
+
+    // Tunggu tombol dilepas
+    while (digitalRead(PIN_TOMBOL) == LOW)
+    {
+        delay(50);
+    }
+    delay(200);
+
+    // Wake-up saat tombol ditekan (LOW)
+    rtc_gpio_pullup_en((gpio_num_t)PIN_TOMBOL);
+    rtc_gpio_pulldown_dis((gpio_num_t)PIN_TOMBOL);
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOMBOL, 0);
+    esp_deep_sleep_start();
+}
+
+// Layar OFF: hanya progress bar baterai + animasi charging.
+// Tampil minimal 30 detik (diperpanjang tiap tombol di-tap) dan terus tampil selama charging.
+// Tahan tombol 5 detik = nyalakan sistem kembali.
+static void layarChargingOff()
+{
+    delay(1500); // beban baru dilepas, biarkan tegangan stabil dulu
+    resetDeteksiCharging();
+
+    unsigned long start = millis();
+    while (true)
+    {
+        tampilkanLayarCharging();
+
+        if (digitalRead(PIN_TOMBOL) == LOW)
+        {
+            if (tahanTombol5Detik(F("Tahan untuk ON...")))
+            {
+                ESP.restart(); // boot normal
+            }
+            start = millis(); // tap: perpanjang tampilan
+        }
+
+        if (!statusCharging() && millis() - start > 30000)
+            break;
+
+        delay(100);
+    }
+}
+
+// Matikan sistem: kipas off, WiFi off, tampilkan layar charging, lalu Deep Sleep
 void masukDeepSleep()
 {
     digitalWrite(PIN_KIPAS, LOW);
@@ -382,21 +433,18 @@ void masukDeepSleep()
     digitalWrite(PIN_BUZZER, LOW);
     delay(700);
 
-    display.clearDisplay();
-    display.display();
-
-    // Tunggu tombol dilepas
+    // Tunggu tombol dilepas agar tidak langsung dianggap tap
     while (digitalRead(PIN_TOMBOL) == LOW)
     {
         delay(50);
     }
     delay(200);
 
-    // Wake-up saat tombol ditekan (LOW)
-    rtc_gpio_pullup_en((gpio_num_t)PIN_TOMBOL);
-    rtc_gpio_pulldown_dis((gpio_num_t)PIN_TOMBOL);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_TOMBOL, 0);
-    esp_deep_sleep_start();
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+
+    layarChargingOff();
+    mulaiDeepSleep();
 }
 
 // Tampilkan progress bar tahan tombol; return true jika ditahan 5 detik
@@ -421,14 +469,16 @@ bool tahanTombol5Detik(const __FlashStringHelper *label)
     return false;
 }
 
-// Bangun dari Deep Sleep: wajib tahan tombol 5 detik, jika tidak tidur lagi
+// Bangun dari Deep Sleep: tahan tombol 5 detik = nyala.
+// Tap singkat = tampilkan layar charging, lalu tidur lagi.
 void bootPowerGate()
 {
     if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0)
     {
         if (!tahanTombol5Detik(F("Tahan untuk ON...")))
         {
-            masukDeepSleep();
+            layarChargingOff();
+            mulaiDeepSleep();
         }
     }
 }

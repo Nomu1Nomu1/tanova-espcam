@@ -133,6 +133,63 @@ void tampilkanBaterai()
     display.fillRect(x + 2, y + 2, isi, h - 4, SH110X_WHITE);
 }
 
+bool statusCharging() { return sedangCharging; }
+
+// Reset deteksi charging (dipanggil saat beban berubah, mis. setelah sistem dimatikan)
+void resetDeteksiCharging()
+{
+    vTrendRef = 0;
+    lastTrendMs = 0;
+    sedangCharging = false;
+}
+
+// Layar penuh saat sistem OFF: hanya progress bar kapasitas 0-100% + animasi charging
+void tampilkanLayarCharging()
+{
+    updateBaterai();
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SH110X_WHITE);
+    const char *judul = sedangCharging ? "CHARGING" : "BATERAI";
+    display.setCursor((SCREEN_WIDTH - (int)strlen(judul) * 6) / 2, 2);
+    display.print(judul);
+
+    // Progress bar besar
+    const int x = 4, y = 16, w = 114, h = 24;
+    display.drawRect(x, y, w, h, SH110X_WHITE);
+    display.fillRect(x + w, y + 7, 4, h - 14, SH110X_WHITE); // kutub +
+    const int inner = w - 6;
+    int isi = map(persenTampil, 0, 100, 0, inner);
+    if (sedangCharging)
+    {
+        // Animasi: isi bergerak dari level saat ini sampai penuh, lalu ulang
+        int frame = (millis() / 300) % 6; // 0..5
+        isi = isi + ((inner - isi) * frame) / 5;
+    }
+    display.fillRect(x + 3, y + 3, isi, h - 6, SH110X_WHITE);
+
+    // Persen besar di tengah
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d%%", persenTampil);
+    int pw = strlen(buf) * 12;
+    display.setTextSize(2);
+    display.setCursor((SCREEN_WIDTH - pw) / 2, 46);
+    display.print(buf);
+
+    // Ikon petir di kiri angka saat charging
+    if (sedangCharging)
+    {
+        int bx = (SCREEN_WIDTH - pw) / 2 - 14;
+        int by = 46;
+        display.drawLine(bx + 5, by, bx + 1, by + 8, SH110X_WHITE);
+        display.drawLine(bx + 1, by + 8, bx + 7, by + 8, SH110X_WHITE);
+        display.drawLine(bx + 7, by + 8, bx + 3, by + 16, SH110X_WHITE);
+    }
+
+    display.display();
+}
+
 // ---------------- Helper teks ----------------
 
 // Ambil nama utama (buang nama Latin dalam kurung) dan potong sesuai lebar
