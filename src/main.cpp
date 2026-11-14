@@ -39,7 +39,7 @@ const float CONFIDENCE_THRESHOLD = 0.5;
 
 // Jeda deteksi otomatis, dihitung setelah request selesai.
 // Gemini free tier: 15 request/menit, 1500/hari -> 60 detik = ~1440/hari.
-const unsigned long DETECT_INTERVAL_MS = 5UL * 1000UL;
+const unsigned long DETECT_INTERVAL_MS = 60UL * 1000UL;
 
 String latestDisease = "Standby";
 float latestConfidence = 0.0;
@@ -298,11 +298,14 @@ void runDiseaseCheck()
 
     // Hanya ambil field yang dibutuhkan (field "text" panjang, tidak dipakai)
     JsonDocument filter;
-    filter["status"] = true;
-    filter["plant"] = true;
-    filter["problem"] = true;
+    // Backend Tanova (/api/v1/ai/analyze): 201 = tersimpan, 200 + is_plant:false = bukan tanaman
+    filter["saved"] = true;
+    filter["is_plant"] = true;
+    filter["label"] = true;
     filter["confidence"] = true;
-    filter["error"] = true;
+    filter["category"] = true;
+    filter["details"]["plant"] = true;
+    filter["message"] = true;
 
     JsonDocument doc;
     DeserializationError error = deserializeJson(doc, response, DeserializationOption::Filter(filter));
@@ -315,8 +318,8 @@ void runDiseaseCheck()
         return;
     }
 
-    // 422 = gambar bukan tanaman
-    if (httpCode == 422)
+    // 200 + is_plant:false = gambar bukan tanaman (tidak disimpan backend)
+    if (httpCode == 200 && doc["is_plant"] == false)
     {
         Serial.println("[Detect] Not a plant, ignoring.");
         latestDisease = "Bukan Tanaman";
@@ -324,20 +327,21 @@ void runDiseaseCheck()
         return;
     }
 
-    if (httpCode != 200)
+    // 201 = diagnosis tersimpan di backend
+    if (httpCode != 201)
     {
-        const char *errMsg = doc["error"] | "unknown";
+        const char *errMsg = doc["message"] | "unknown";
         Serial.printf("[Detect] API error %d: %s\n", httpCode, errMsg);
         latestDisease = "API Error";
         latestConfidence = 0.0;
         return;
     }
 
-    const char *status = doc["status"] | "";
-    const char *plant = doc["plant"] | "unknown";
-    float confidence = (doc["confidence"] | 0.0f) / 100.0f; // API: 0-100, internal: 0-1
+    const char *category = doc["category"] | "";
+    const char *plant = doc["details"]["plant"] | "unknown";
+    float confidence = doc["confidence"] | 0.0f; // backend sudah 0-1
 
-    if (strcmp(status, "healthy") == 0)
+    if (strcmp(category, "leaf_health") == 0)
     {
         Serial.printf("[Detect] Healthy: %s (%.1f%% confidence)\n", plant, confidence * 100);
         latestDisease = "Healthy/Clear";
@@ -345,13 +349,7 @@ void runDiseaseCheck()
         return;
     }
 
-    if (strcmp(status, "disease") != 0)
-    {
-        Serial.printf("[Detect] Unexpected status: '%s'\n", status);
-        return;
-    }
-
-    const char *problem = doc["problem"] | "unknown";
+    const char *problem = doc["label"] | "unknown";
     latestDisease = String(problem);
     latestConfidence = confidence;
 
